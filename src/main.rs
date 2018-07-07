@@ -1,4 +1,3 @@
-#![feature(test)]
 #[macro_use]
 extern crate lazy_static;
 #[macro_use]
@@ -12,13 +11,13 @@ extern crate clap;
 extern crate yaml_rust;
 extern crate parking_lot;
 extern crate fnv;
-extern crate bounded_spsc_queue as spsc;
 extern crate chan_signal;
 extern crate pcap;
 extern crate bpfjit;
 extern crate chrono;
 extern crate influent;
 extern crate concurrent_hash_map;
+extern crate url;
 
 use std::fmt;
 use std::str::FromStr;
@@ -26,7 +25,6 @@ use std::cell::RefCell;
 use std::thread;
 use std::path::PathBuf;
 use std::time::Duration;
-use std::sync::atomic::{AtomicUsize};
 use std::sync::Arc;
 use std::net::Ipv4Addr;
 use pnet::util::MacAddr;
@@ -46,15 +44,14 @@ mod sha1;
 mod packet;
 mod csum;
 mod util;
-mod tx;
-mod rx;
+mod ring;
 mod uptime;
 mod config;
 mod filter;
 mod logging;
 mod metrics;
 use uptime::UptimeReader;
-use packet::{IngressPacket};
+use packet::IngressPacket;
 use netmap::{Direction,NetmapDescriptor};
 
 // TODO: split "routing" into its own file
@@ -94,14 +91,14 @@ impl fmt::Debug for StateTable {
         fn decode_val(v: usize) -> ConnState {
             ConnState::from((v & 0xffffffff) - 1)
         }
-        for entry in entries.iter() {
+        for entry in &entries {
             try!(write!(f, "{:?} -> {:?}\n", decode_key(entry.0), decode_val(entry.1)));
         }
         write!(f, "StateTable: {} entries\n", self.map.len())
     }
 }
 
-#[derive(Debug,Eq,PartialEq)]
+#[derive(Debug,Eq,PartialEq,Copy,Clone)]
 enum ConnState {
     Established, // first ACK received and valid
     Closing, // FIN received
@@ -183,7 +180,7 @@ impl RoutingTable {
             let mut cache = rt.borrow_mut();
 
             // merge configurations
-            for ip in ips.iter() {
+            for ip in &ips {
                 ::RoutingTable::with_host_config_global(*ip, |hc| {
                     match cache.entry(*ip) {
                         Entry::Vacant(ve) => {
@@ -198,7 +195,7 @@ impl RoutingTable {
             }
             // remove extra keys
             let ips: Vec<Ipv4Addr> = cache.keys().cloned().collect();
-            for ip in ips.iter() {
+            for ip in &ips {
                 if ::RoutingTable::with_host_config_global(*ip, |_| {}).is_none() {
                     cache.remove(ip);
                 }
@@ -211,7 +208,7 @@ impl RoutingTable {
         LOCAL_ROUTING_TABLE.with(|rt| {
             for ip in ips {
                 let r = rt.borrow();
-                if let Some(ref hc) = r.get(&ip) {
+                if let Some(hc) = r.get(&ip) {
                     println!("[{}] {:?}", ip, hc.state_table);
                 }
             }
@@ -273,6 +270,7 @@ pub struct HostConfiguration {
     filters: Arc<Vec<(BpfJitFilter,filter::FilterAction)>>,
     default: filter::FilterAction,
     passthrough: bool,
+    packets: u32,
 }
 
 impl HostConfiguration {
@@ -287,6 +285,7 @@ impl HostConfiguration {
             filters: Arc::new(filters),
             default: default,
             passthrough: pt,
+            packets: 0,
         }
     }
 
@@ -300,6 +299,7 @@ impl HostConfiguration {
         self.default = other.default;
         self.passthrough = other.passthrough;
         // skip copying state_table
+        self.packets = other.packets;
     }
 }
 
@@ -310,11 +310,12 @@ impl Clone for HostConfiguration {
             tcp_timestamp: self.tcp_timestamp,
             tcp_cookie_time: self.tcp_cookie_time,
             hz: self.hz,
-            syncookie_secret: self.syncookie_secret.clone(),
+            syncookie_secret: self.syncookie_secret,
             state_table: self.state_table.clone(),
             filters: self.filters.clone(),
             default: self.default,
             passthrough: self.passthrough,
+            packets: self.packets,
         }
     }
 }
@@ -335,13 +336,15 @@ pub enum OutgoingPacket {
 fn run_uptime_readers(reload_lock: Arc<(Mutex<bool>, Condvar)>, uptime_readers: Vec<(Ipv4Addr, Box<UptimeReader>)>) {
     let one_sec = Duration::new(1, 0);
     crossbeam::scope(|scope| {
-        for (ip, uptime_reader) in uptime_readers.into_iter() {
+        for (ip, mut uptime_reader) in uptime_readers {
             let reload_lock = reload_lock.clone();
             info!("Uptime reader for {} starting", ip);
-            scope.spawn(move|| loop {
+            scope.spawn(move || loop {
                 ::util::set_thread_name(&format!("syncookied/{}", ip));
                 match uptime_reader.read() {
-                    Ok(buf) => uptime::update(ip, buf),
+                    Ok(buf) => if let Err(err) = uptime::update(ip, buf) {
+                        error!("Failed to parse uptime: {:?}", err);
+                    },
                     Err(err) => error!("Failed to read uptime: {:?}", err),
                 }
                 thread::sleep(one_sec);
@@ -430,9 +433,7 @@ fn handle_signals(path: PathBuf, reload_lock: Arc<(Mutex<bool>, Condvar)>) {
                 info!("SIGHUP received, reloading configuration");
                 match config::configure(&path) {
                     Ok(data) => {
-                        let uptime_readers = data.iter().map(|&(ip, ref addr)|
-                                                (ip, Box::new(uptime::UdpReader::new(addr.to_owned())) as Box<UptimeReader>)
-                                               ).collect();
+                        let uptime_readers = data;
                         /* wait for old readers to die */
                         {
                             let &(ref lock, ref cv) = &*reload_lock;
@@ -467,18 +468,16 @@ fn handle_signals(path: PathBuf, reload_lock: Arc<(Mutex<bool>, Condvar)>) {
 
 // TODO: too many parameters, put them into a struct
 fn run(config: PathBuf, rx_iface: &str, tx_iface: &str,
-       rx_mac: MacAddr, tx_mac: MacAddr,
+       rx_mac: MacAddr, _tx_mac: MacAddr,
        qlen: u32, first_cpu: usize,
        uptime_readers: Vec<(Ipv4Addr, Box<UptimeReader>)>,
        metrics_server: Option<&str>) {
     let rx_nm = Arc::new(Mutex::new(NetmapDescriptor::new(rx_iface).unwrap()));
-    let multi_if = rx_iface != tx_iface;
-    let tx_nm = if multi_if {
-         let rx_nm = &*rx_nm.lock();
-         Arc::new(Mutex::new(NetmapDescriptor::new_with_memory(tx_iface, rx_nm).unwrap()))
-     } else {
-         rx_nm.clone()
-    };
+    let tx_nm = rx_nm.clone();
+
+    if rx_iface != tx_iface {
+        panic!("This option is not implemented");
+    }
     let rx_count = {
         let rx_nm = rx_nm.lock();
         rx_nm.get_rx_rings_count()
@@ -499,117 +498,38 @@ fn run(config: PathBuf, rx_iface: &str, tx_iface: &str,
         scope.spawn(move ||
                     run_uptime_readers(reload_lock.clone(), uptime_readers));
 
-        scope.spawn(move || state_table_gc());
+        scope.spawn(state_table_gc);
 
-        // we spawn a thread per RX/TX queue
+        // we spawn a thread per queue
         for ring in 0..rx_count {
             let ring = ring;
-            let (tx, rx) = spsc::make(qlen as usize);
-            let (f_tx, f_rx) = spsc::make(qlen as usize);
-            let pair = Arc::new(AtomicUsize::new(0));
-            let rx_pair = pair.clone();
+            let rx_nm = rx_nm.clone();
 
-            {
-                let rx_nm = rx_nm.clone();
-
-                scope.spawn(move || {
-                    info!("Starting RX thread for ring {} at {}", ring, rx_iface);
-                    let mut ring_nm = {
-                        let nm = rx_nm.lock();
-                        nm.clone_ring(ring, Direction::Input).unwrap()
-                    };
-                    let cpu = first_cpu + ring as usize;
-                    rx::Receiver::new(ring, cpu, f_tx, tx, &mut ring_nm, rx_pair, rx_mac.clone(), metrics_server).run();
-                });
-            }
-
-            /* Start an ARP thread to keep switch from forgetting about us */
-            /*
-            if multi_if && ring == 0 {
-                    let rx_nm = rx_nm.clone();
-
-                    scope.spawn(move || {
-                    info!("Starting ARP thread for ring {} at {}", ring, rx_iface);
-                    let mut ring_nm = {
-                        let nm = rx_nm.lock().unwrap();
-                        nm.clone_ring(ring, Direction::Output).unwrap()
-                    };
-                    let cpu = ring as usize;
-                    /* XXX: replace hardcoded IPs */
-                    arp::Sender::new(ring, cpu, &mut ring_nm, rx_mac.clone(), Ipv4Addr::new(185,50,25,2), Ipv4Addr::new(185,50,25,1)).run();
-                });
-            }
-            */
-
-            /* second half */
-            let f_rx = if multi_if {
-                let f_tx_nm = rx_nm.clone();
-                let pair = pair.clone();
-                scope.spawn(move || {
-                    info!("Starting TX thread for ring {} at {}", ring, rx_iface);
-                    let mut ring_nm = {
-                        let nm = f_tx_nm.lock();
-                        nm.clone_ring(ring, Direction::Output).unwrap()
-                    };
-                    let cpu = first_cpu + ring as usize; /* we assume queues/rings are bound to cpus */
-                    tx::Sender::new(ring, cpu, None, Some(f_rx), &mut ring_nm, pair, rx_mac.clone(), metrics_server).run();
-                });
-                None
-            } else {
-                Some(f_rx)
-            };
-
-            let tx_nm = tx_nm.clone();
             scope.spawn(move || {
-                info!("Starting TX thread for ring {} at {}", ring, tx_iface);
+                info!("Starting RX/TX thread for ring {} at {}", ring, rx_iface);
                 let mut ring_nm = {
-                    let nm = tx_nm.lock();
-                    nm.clone_ring(ring, Direction::Output).unwrap()
+                    let nm = rx_nm.lock();
+                    nm.clone_ring(ring, Direction::InputOutput).unwrap()
                 };
-                /* We assume that in multi_if configuration
-                 *  - RX queues are bound to [first_cpu .. first_cpu + rx_count]
-                 *  - TX queues are bound to [ first_cpu + rx_count .. first_cpu + rx_count + tx_count ]
-                 */
-                let cpu = if multi_if {
-                    rx_count as usize
-                } else {
-                    0
-                } + first_cpu + ring as usize;
-                tx::Sender::new(ring, cpu, Some(rx), f_rx, &mut ring_nm, pair, tx_mac, metrics_server).run();
+                let cpu = first_cpu + ring as usize;
+                ring::Worker::new(ring, cpu, &mut ring_nm, rx_mac, metrics_server).run();
             });
         }
-
-        /*
-        {
-            let nm = rx_nm.clone();
-            let ring = rx_count;
-
-            scope.spawn(move || {
-                    info!("Starting Host RX thread for ring {}", ring);
-                    let mut ring_nm = {
-                        let nm = nm.lock().unwrap();
-                        nm.clone_ring(ring, Direction::Input).unwrap()
-                    };
-                    host_rx_loop(ring as usize, &mut ring_nm)
-            });
-
-        }
-        */
     });
 }
 
 fn main() {
     let matches = App::new("syncookied")
-                              .version("0.2.4")
-                              .author("Alexander Polyakov <apolyakov@beget.ru>")
+                              .version(env!("CARGO_PKG_VERSION"))
+                              .author(env!("CARGO_PKG_AUTHORS"))
                               .setting(AppSettings::SubcommandsNegateReqs)
                               .subcommand(
                                 SubCommand::with_name("server")
                                 .about("Run /proc/beget_uptime reader")
                                 .arg(Arg::with_name("addr")
                                      .takes_value(true)
-                                     .value_name("ip:port")
-                                     .help("ip:port to listen on"))
+                                     .value_name("[tcp|udp]://ip:port")
+                                     .help("address to listen on"))
                               )
                               .arg(Arg::with_name("config")
                                    .short("c")
@@ -683,7 +603,7 @@ fn main() {
         let tx_mac: MacAddr = matches.value_of("out-mac")
                                 .map(str::to_owned)
                                 .or_else(|| util::get_iface_mac(tx_iface).ok())
-                                .map(|mac| MacAddr::from_str(&mac).expect("Expected valid mac")).unwrap_or(rx_mac.clone());
+                                .map(|mac| MacAddr::from_str(&mac).expect("Expected valid mac")).unwrap_or(rx_mac);
         let ncpus = util::get_cpu_count();
         let qlen = matches.value_of("qlen")
                           .map(|x| u32::from_str(x).expect("Expected number for queue length"))
@@ -699,12 +619,9 @@ fn main() {
         match config::configure(&config_path) {
             Ok(config) => {
                 debug!("Config file {} loaded", config_path.display());
-                let uptime_readers =
-                    config.iter().map(|&(ip, ref addr)|
-                        (ip, Box::new(uptime::UdpReader::new(addr.to_owned())) as Box<UptimeReader>)
-                    ).collect();
+                let uptime_readers = config;
                 info!("interfaces: [Rx: {}/{}, Tx: {}/{}] Cores: {}", rx_iface, rx_mac, tx_iface, tx_mac, ncpus);
-                run(config_path, &rx_iface, &tx_iface, rx_mac, tx_mac, qlen, cpu, uptime_readers, metrics_server);
+                run(config_path, rx_iface, tx_iface, rx_mac, tx_mac, qlen, cpu, uptime_readers, metrics_server);
             },
             Err(e) => error!("Error parsing config file {}: {:?}", config_path.display(), e),
         }

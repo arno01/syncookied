@@ -5,14 +5,13 @@ use std::mem;
 use std::net::Ipv4Addr;
 use std::num::Wrapping;
 
-static MSSTAB: [u16;4] = [ 1460, 1440, 1300, 536 ];
+static MSSTAB: [u16;4] = [ 536, 1300, 1440, 1460 ];
 const COOKIEBITS: u32 = 24;	/* Upper bits store count */
 const COOKIEMASK: u32 = ((1 << COOKIEBITS) - 1);
 const SHA_WORKSPACE_WORDS: usize = 16;
 
 #[allow(dead_code)]
 const MAX_SYNCOOKIE_AGE: u32 = 2;
-
 
 #[inline]
 fn cookie_hash(source_addr: u32, dest_addr: u32, source_port: u16, dest_port: u16,
@@ -28,7 +27,7 @@ fn cookie_hash(source_addr: u32, dest_addr: u32, source_port: u16, dest_port: u1
         // TODO: use cargo features or runtime detection to choose the fastest
         //
         //::sha1::sha1_transform_ssse3(tmp.as_mut_ptr().offset(16), tmp.as_ptr() as *const u8, 1);
-        ::sha1::sha1_transform_avx(tmp.as_mut_ptr().offset(16), tmp.as_ptr() as *const u8, 1);
+        ::sha1::sha1_transform_platform(tmp.as_mut_ptr().offset(16), tmp.as_ptr() as *const u8, 1);
         //::sha1::sha_transform(tmp.as_mut_ptr().offset(16), tmp.as_ptr() as *const u8, tmp.as_mut_ptr().offset(16 + 5));
     }
 
@@ -59,12 +58,12 @@ fn secure_tcp_syn_cookie(source_addr: u32, dest_addr: u32, source_port: u16,
 pub fn generate_cookie_init_sequence(source_addr: Ipv4Addr, dest_addr: Ipv4Addr,
                                      source_port: u16, dest_port: u16,
                                      seq: u32, mss: u16, tcp_cookie_time: u32, secret: &[[u32;17];2]) -> (u32,u16) {
-    let mut mssind = 3;
-    let mut mssval = 1460;
+    let mut mssind = 0;
+    let mut mssval = 536;
 
-    for (idx, val) in MSSTAB.iter().enumerate() {
+    for (idx, val) in MSSTAB.iter().enumerate().rev() {
         if mss >= *val {
-            mssind = (MSSTAB.len() - idx - 1) as u32;
+            mssind = idx as u32;
             mssval = *val;
             break;
         }
@@ -112,7 +111,7 @@ pub fn cookie_check(source_addr: Ipv4Addr, dest_addr: Ipv4Addr,
     if mssind > 3 {
         //println!("COOKIE MSS IDX: {}", mssind);
     }
-    MSSTAB.get(MSSTAB.len() - (mssind as usize) - 1)
+    MSSTAB.get((mssind as usize))
 }
 
 /*
@@ -138,7 +137,7 @@ fn test_cookie_init() {
 
 /// TCP options encoded in timestamp
 #[inline]
-pub fn synproxy_init_timestamp_cookie(wscale: u8, sperm: u8, ecn: u8, tcp_time_stamp: u32) -> u32 {
+pub fn synproxy_init_timestamp_cookie(wscale: u8, sperm: bool, ecn: bool, tcp_time_stamp: u32) -> u32 {
     let mut tsval: u32 = tcp_time_stamp & !0x3f;
     let mut options: u32 = 0;
 
@@ -148,11 +147,11 @@ pub fn synproxy_init_timestamp_cookie(wscale: u8, sperm: u8, ecn: u8, tcp_time_s
         options |= 0xf;
     }
 
-    if sperm != 0 {
+    if sperm {
         options |= 1 << 4;
     }
 
-    if ecn != 0 {
+    if ecn {
         options |= 1 << 5;
     }
 

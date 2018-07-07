@@ -12,9 +12,12 @@ better performance under SYN flood attacks thanks to kernel bypass (netmap).
 Installation
 ============
 
-1. Install nightly rust (instructions here: https://www.rust-lang.org/en-US/downloads.html)
+1. Install rust (instructions here: https://www.rust-lang.org/en-US/downloads.html)
 2. Install `build-essential` and `libpcap-dev` or equivalent package for your distribution
-3. run `cargo build --release`, resulting binary will be found in target/release/syncookied.
+3. Install [netmap](https://github.com/luigirizzo/netmap). Make sure netmap.h / netmap_user.h can be found in /usr/include. Alternative you can point CFLAGS variable to their location: [example](https://github.com/LTD-Beget/syncookied/blob/master/.travis.yml).
+4. run `cargo build --release`, resulting binary will be found in target/release/syncookied. 
+
+Note: we use [AVX](https://en.wikipedia.org/wiki/Advanced_Vector_Extensions)-accelerated SHA1 function by default. SSE3 implementation is also available under sse3 feature flag, i.e.:  `cargo build --features=sse3 --no-default-features --release`.
 
 How to run
 ==========
@@ -22,8 +25,8 @@ How to run
 On server you want to protect
 ------------------------------
 1. Install [tcpsecrets](https://github.com/LTD-Beget/tcpsecrets) linux kernel mode to expose tcp syncookie key and timestamp
-2. Start syncookied in `server` mode: `syncookied server <ip:port>`. Running this 
-commands automatically sets `net.ipv4.tcp_syncookies` to 2 (always) and starts a UDP server on specified ip/port.
+2. Start syncookied in `server` mode: `syncookied server <proto://ip:port>`. Running this 
+commands automatically starts a TCP or UDP server on specified ip/port and sets `net.ipv4.tcp_syncookies` to 2 on first request.
 
 On server you want to use for packet processing
 -----------------------------------------------
@@ -50,10 +53,10 @@ On server you want to use for packet processing
 4. Create hosts.yml file in the working directory, which looks like this
    ```
    - ip: 185.50.25.4
-     local_ip: 192.168.3.231:1488
+     secrets_addr: udp://192.168.3.231:1488
      mac: 0c:c4:7a:6a:fa:bf
    ```
-Here ip is the ip you want to protect, local_ip is the address where you run the UDP server and mac is the protected server's mac address.
+Here ip is external ip you want to protect, secrets_addr is the address of syncookied server running on protected host, and mac is its MAC address.
 
 5. Run `syncookied -i eth2`. It will print something like this:
    ```
@@ -101,6 +104,14 @@ It's possible to filter traffic by adding "filters" section to host configuratio
 Filters are written in pcap syntax. Consult `pcap-filter(7)` for more information. 
 Default policy is "pass". It can be changed by using `default` key.
 Note that filtering happens on layer 4.
+
+Troubleshooting
+---------------
+Please check the [FAQ](https://github.com/LTD-Beget/syncookied/wiki) before filing an issue.
+
+Need help?
+----------
+Join us on Telegram: https://telegram.me/syncookied
 
 Performance
 ===========
